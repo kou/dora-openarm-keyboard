@@ -90,11 +90,7 @@ The home pose defaults are the end-effector poses of the scene's `home`
 keyframe, expressed in its `arm_origin` frame. The IK and MuJoCo nodes start
 from that same keyframe, so publishing anything else would make IK drag both
 arms across the workspace on the first tick. After changing scene or keyframe,
-regenerate them:
-
-```bash
-dev/home_pose.py --xml path/to/scene.xml --keyframe home
-```
+we need to follow the changes.
 
 ## Quick start
 

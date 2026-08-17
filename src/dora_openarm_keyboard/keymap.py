@@ -43,7 +43,7 @@ Z = YAW = 2
 
 # key -> (arm, kind, axis, sign).  For GRIP, sign +1 closes and -1 opens.
 KEYMAP: dict[str, tuple[str, str, int, int]] = {
-    # ── left arm ─────────────────────────────────────────────────────────────
+    # left arm
     "w": (LEFT, LINEAR, X, +1),
     "s": (LEFT, LINEAR, X, -1),
     "a": (LEFT, LINEAR, Y, +1),
@@ -58,7 +58,7 @@ KEYMAP: dict[str, tuple[str, str, int, int]] = {
     "b": (LEFT, ANGULAR, ROLL, -1),
     "g": (LEFT, GRIP, 0, +1),
     "v": (LEFT, GRIP, 0, -1),
-    # ── right arm ────────────────────────────────────────────────────────────
+    # right arm
     "u": (RIGHT, LINEAR, X, +1),
     "j": (RIGHT, LINEAR, X, -1),
     "h": (RIGHT, LINEAR, Y, +1),

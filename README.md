@@ -1,7 +1,19 @@
 # dora-openarm-keyboard
 
 A [dora-rs](https://dora-rs.ai/) node that teleoperates OpenArm from
-the keyboard.
+the keyboard in a Web browser.
+
+The node serves a web page (default `http://127.0.0.1:8080/`) that does
+both halves of teleoperation in one browser tab:
+
+- **Keys in**: the page captures the key bindings below and sends them
+  over a WebRTC data channel. They only work while the tab has focus,
+  and losing focus (or closing the tab, or losing the network) releases
+  every held key — an unwatched browser can never keep the robot moving.
+- **Video out**: JPEG frames arriving on the node's optional `image`
+  input are streamed to the page as WebRTC video. Wire it to a
+  `camera_*` output of `dora-openarm-mujoco --render` to watch the
+  simulation from the browser.
 
 It publishes end-effector pose targets with the same output contract
 as
@@ -39,40 +51,25 @@ stops the moment it is released. Rotation is integrated in the **tool frame**,
 so roll, pitch and yaw stay relative to the gripper rather than the world.
 
 There is no arm/disarm and no stop key: releasing the keys *is* the stop, and a
-node nobody is touching publishes the pose it already holds. Keys are captured
-globally though, so the motion keys reach the robot from whatever window has
-focus — quit the dataflow before typing elsewhere.
+node nobody is touching publishes the pose it already holds. Keys only reach
+the robot while the browser page has focus, and losing focus releases
+everything held, so switching windows is itself safe.
+
+By default the page is only reachable from the node's own machine. To operate
+from another machine, pass `--host 0.0.0.0` and open `http://<node-host>:8080/`
+(browsers allow WebRTC on plain HTTP; camera/mic-free pages like this one need
+no HTTPS).
 
 ## When the keys do nothing
 
-The node logs enough at startup to tell you where it stopped:
-
-```
-[teleop] keys are captured globally — they drive the robot from whatever window has focus.
-[teleop] macOS accessibility trusted: False
-[teleop] keyboard listener running: True
-[teleop] keyboard listener is delivering events (first: 'w')
-```
-
-The last line appears on your first keystroke and is the one that matters — it
-proves keys are getting through. If it never appears, the node says so after ten
-seconds.
-
-**Is the `delivering events` line there?** If not, macOS is withholding global
-capture. Grant Accessibility to *the program that launched dora* — your
-terminal, or your IDE if you started it from there — under **System Settings →
-Privacy & Security → Accessibility**, then restart the dataflow. The permission
-belongs to that program, not to `python`.
-
-The `accessibility trusted` line is context, not a verdict: `AXIsProcessTrusted`
-reports `False` on setups whose events arrive perfectly well, so trust the
-`delivering events` line over it.
+Check the page: is it open, does its header say *connected*, and does the tab
+actually have focus (click the page once)?
 
 ## Interface
 
 | | |
 |---|---|
-| **Inputs** | `tick` — one integration step per event |
+| **Inputs** | `tick` — keep-alive only, any rate works (the node integrates and publishes at its own 500 Hz pace); `image` (optional) — JPEG frame to stream to the browser, e.g. a `camera_*` output of `dora-openarm-mujoco --render` |
 | **Outputs** | `pose_right`, `pose_left` `[{"pose": float32[8]}]` — `[px, py, pz, qw, qx, qy, qz, gripper_angle]` in the scene's `arm_origin` frame; `status` `string[1]` |
 
 ```
@@ -84,7 +81,12 @@ reports `False` on setups whose events arrive perfectly well, so trust the
 --home-rpy       home orientation in degrees   (default: 0 -90 0)
 --pos-min        lower workspace bound X Y Z   (default: -0.8 -0.8 -0.8)
 --pos-max        upper workspace bound X Y Z   (default: 0.8 0.8 0.8)
+--host           web server bind address       (default: 127.0.0.1)
+--port           web server port               (default: 8080)
 ```
+
+The `--host` and `--port` defaults can also be overridden with the `HOST`
+and `PORT` environment variables; explicit `--host`/`--port` still win.
 
 The home pose defaults are the end-effector poses of the scene's `home`
 keyframe, expressed in its `arm_origin` frame. The IK and MuJoCo nodes start
@@ -95,17 +97,16 @@ we need to follow the changes.
 ## Quick start
 
 [`example/dataflow-mujoco.yaml`](example/dataflow-mujoco.yaml) drives both arms
-in the MuJoCo viewer through IK, with no VR headset and no real OpenArm:
+in MuJoCo through IK, with no VR headset and no real OpenArm, and streams
+MuJoCo's ceiling camera back to the browser:
 
 ```bash
 uv run dora build example/dataflow-mujoco.yaml --uv
 uv run dora run example/dataflow-mujoco.yaml --uv
 ```
 
-The arms hold their startup pose until you press a key.
-
-On macOS the MuJoCo viewer only opens under `mjpython`, so point the `viewer`
-node's `path` at a wrapper that execs it instead of at `dora-openarm-mujoco`.
+Then open <http://127.0.0.1:8080/> and click the page. The arms hold their
+startup pose until you press a key.
 
 To record what you teleoperate, use `dataflow-keyboard-mujoco.yaml` in
 [`dora-openarm-data-collection`](https://github.com/enactic/dora-openarm-data-collection)
@@ -118,8 +119,9 @@ uv sync
 uv run pytest tests
 ```
 
-The pose integrator in `teleop.py` imports neither `dora` nor `pynput`, so the
-whole state machine is tested without a dataflow or a keyboard.
+The pose integrator in `teleop.py` imports neither `dora` nor the WebRTC
+stack, so the whole state machine is tested without a dataflow or a browser;
+`tests/test_web.py` exercises the WebRTC server end to end in-process.
 
 ## License
 

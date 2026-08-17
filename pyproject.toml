@@ -16,15 +16,16 @@
 name = "dora-openarm-keyboard"
 version = "0.1.0"
 authors = [{ name = "Enactic, Inc." }]
-description = "Dora node that teleoperates OpenArm from the keyboard"
+description = "Dora node that teleoperates OpenArm from the keyboard in a Web browser over WebRTC"
 license = { text = "Apache-2.0" }
 readme = "README.md"
 requires-python = ">=3.11"
 
 dependencies = [
+  "aiohttp >= 3.9",
+  "aiortc >= 1.9",
   "dora-rs >= 0.5.0",
   "numpy",
-  "pynput",
   "pyarrow",
   "scipy",
 ]
@@ -49,6 +50,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+dora_openarm_keyboard = ["static/*.html", "static/*.js"]
 
 [tool.ruff.lint]
 extend-select = [

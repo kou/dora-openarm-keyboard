@@ -12,31 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Keyboard teleoperation against the MuJoCo viewer, with no VR headset and no
-# real OpenArm: keyboard -> end-effector pose targets -> IK -> joint angles ->
-# MuJoCo. The arms move only while a motion key is held.
+# Keyboard teleoperation from a web browser, with no VR headset and no real
+# OpenArm: the keyboard node serves a page (http://127.0.0.1:8080/ by default)
+# that captures keys over a WebRTC data channel and shows the MuJoCo camera as
+# WebRTC video. keyboard -> end-effector pose targets -> IK -> joint angles ->
+# MuJoCo, and MuJoCo's camera back to the browser. The arms move only while a
+# motion key is held and the page has focus.
 
 nodes:
-  - id: tick # ── tick (500 Hz), quittable ────────────────────────────────────
+  - id: tick # tick (1 Hz keep-alive), quittable
     build: pip install dora-openarm-quitter
     path: dora-openarm-quitter
     inputs:
-      tick: dora/timer/millis/2
+      tick: dora/timer/secs/1
     outputs:
       - tick
 
-  - id: keyboard # ── keys → EE pose targets ─────────────────────────────
+  - id: keyboard # browser keys → EE pose targets, camera → browser
     build: pip install -e ..
     path: dora-openarm-keyboard
     args: "--linear-speed 0.05 --angular-speed 0.5"
     inputs:
       tick: tick/tick
+      # Any camera_* output of the viewer works here; ceiling gives the best
+      # overview of both arms.
+      image: viewer/camera_ceiling
     outputs:
       - pose_right
       - pose_left
       - status
 
-  - id: ik # ── differential IK: EE poses → joint angles ───────────────────────
+  - id: ik # differential IK: EE poses → joint angles
     build: pip install dora-openarm-kinematics
     path: dora-openarm-ik
     args: "--mode bimanual --max-iters 10 --dt 0.1 --damping 0.1 --posture-cost 0.01 --lm-damping 0.01"
@@ -49,10 +55,10 @@ nodes:
       - position_right
       - status
 
-  - id: viewer # ── MuJoCo scene the poses are expressed against ───────────────
+  - id: viewer # MuJoCo scene, rendered offscreen for the browser
     build: pip install dora-openarm-mujoco
     path: dora-openarm-mujoco
-    args: "--scene demo --keyframe home --enable-collision --ctrl --viewer --debug-frames"
+    args: "--scene demo --keyframe home --enable-collision --ctrl --render --viewer --debug-frame"
     inputs:
       position_right: ik/position_right
       position_left: ik/position_left
@@ -60,3 +66,4 @@ nodes:
       pose_left: keyboard/pose_left
     outputs:
       - status
+      - camera_ceiling

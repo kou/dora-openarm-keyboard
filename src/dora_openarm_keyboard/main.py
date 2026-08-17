@@ -22,28 +22,33 @@ output contract as dora-openarm-vr so either can feed dora-openarm-ik:
       frame.
   status : string[1]
 
-Keys are captured globally with pynput, which needs Accessibility permission on
-macOS (System Settings -> Privacy & Security -> Accessibility).  Because capture
-is global, the motion keys drive the robot from whatever window has focus; they
-only ever move the target while they are held.
+Keys come from a browser page the node itself serves: they travel over a WebRTC
+data channel and only work while the page has focus, so an unwatched browser
+can never keep the robot moving.  The same page shows the MuJoCo camera stream
+fed into the optional ``image`` input (JPEG frames, e.g. a ``camera_*`` output
+of dora-openarm-mujoco ``--render``) as WebRTC video.
 
-Key events are queued by the listener thread and drained on the dora thread, so
-the teleoperation state is only ever mutated from one thread.
+The dora node and the WebRTC stack share one asyncio loop: dora events are
+polled with ``node.is_empty()`` between short sleeps, so the WebRTC tasks stay
+live without any extra thread.  Pose targets are integrated and published by a
+self-paced task; the dataflow's ``tick`` input is only a keep-alive and its
+rate does not matter.  Key events are queued by the WebRTC handlers and
+drained once per integration step, so the teleoperation state only changes
+there.
 """
 
 import argparse
+import asyncio
+import os
 import queue
-import sys
 import time
 
 import dora
 import numpy as np
 import pyarrow as pa
-from pynput import keyboard
 from scipy.spatial.transform import Rotation
 
 from .keymap import (
-    HELP_TEXT,
     LEFT,
     RESET_KEY,
     RIGHT,
@@ -62,65 +67,24 @@ from .teleop import (
     KeyState,
     TeleopState,
 )
+from .web import WebTeleopServer
 
 _POSE_STRUCT_TYPE = pa.struct({"pose": pa.list_(pa.float32())})
 
 _SPEED_STEP = 1.25
 
-# A stalled dataflow must not teleport the target on the next tick.
+# Integration step period; the node paces itself instead of following a tick.
+_STEP_SECONDS = 0.002
+
+# A stalled loop must not teleport the target on the next step.
 _MAX_DT = 0.1
 
-# How long to wait before pointing out that the listener looks dead.
-_SILENT_LISTENER_SECONDS = 10.0
-
-_SILENT_LISTENER_PREFIX = "pynput is not delivering keystrokes to this process."
-
-_SPECIAL_KEYS = {
-    keyboard.Key.backspace: RESET_KEY,
-}
-
 _CONTROL_KEYS = frozenset((RESET_KEY, *SPEED_UP_KEYS, *SPEED_DOWN_KEYS))
-
-
-_ACCESSIBILITY_HINT = (
-    "Grant Accessibility permission to the program that launched dora — your "
-    "terminal, or your IDE if you started it from there — under System "
-    "Settings -> Privacy & Security -> Accessibility, then restart the "
-    "dataflow. The permission belongs to that program, not to python itself."
-)
-
-
-def accessibility_state() -> bool | None:
-    """Report whether macOS trusts this process to observe input events.
-
-    pynput's macOS backend starts happily without Accessibility permission and
-    then never delivers an event, so an explicit check is the only way to tell
-    the operator why nothing moves.  Returns None where the question does not
-    apply or cannot be answered.
-    """
-    if sys.platform != "darwin":
-        return None
-    try:
-        from ApplicationServices import AXIsProcessTrusted
-    except ImportError:
-        return None
-    return bool(AXIsProcessTrusted())
 
 
 def build_pose_output(pose: np.ndarray) -> pa.Array:
     """Wrap a pose array as a length-1 StructArray: [{"pose": [...]}]."""
     return pa.array([{"pose": pose}], type=_POSE_STRUCT_TYPE)
-
-
-def normalize_key(key) -> str | None:
-    """Map a pynput key to its keymap name, or None if it is not usable."""
-    special = _SPECIAL_KEYS.get(key)
-    if special is not None:
-        return special
-    char = getattr(key, "char", None)
-    if not char:
-        return None
-    return char.lower()
 
 
 class KeyboardTeleop:
@@ -133,23 +97,16 @@ class KeyboardTeleop:
         self.events: queue.SimpleQueue = queue.SimpleQueue()
         self._control_down: set[str] = set()
         self._status: str | None = None
-        self.events_seen = 0
+        # Cleared by the dora loop to let the integrator task finish cleanly.
+        self.running = True
 
-    # ── listener thread ──────────────────────────────────────────────────────
+    # WebRTC handlers
 
-    def on_press(self, key) -> None:
-        """Queue a key-down event. Called from the listener thread."""
-        name = normalize_key(key)
-        if name is not None:
-            self.events.put(("press", name))
+    def enqueue(self, action: str, name: str) -> None:
+        """Queue a normalized key event ("press" or "release")."""
+        self.events.put((action, name))
 
-    def on_release(self, key) -> None:
-        """Queue a key-up event. Called from the listener thread."""
-        name = normalize_key(key)
-        if name is not None:
-            self.events.put(("release", name))
-
-    # ── dora thread ──────────────────────────────────────────────────────────
+    # integrator task
 
     def drain(self) -> None:
         """Apply every queued key event in the order it arrived."""
@@ -158,13 +115,6 @@ class KeyboardTeleop:
                 action, name = self.events.get_nowait()
             except queue.Empty:
                 return
-            self.events_seen += 1
-            if self.events_seen == 1:
-                print(
-                    f"[teleop] keyboard listener is delivering events "
-                    f"(first: {name!r})",
-                    flush=True,
-                )
             if name not in _CONTROL_KEYS:
                 if action == "press":
                     self.keys.press(name)
@@ -190,7 +140,7 @@ class KeyboardTeleop:
 
     def _note(self, status: str) -> None:
         self._status = status
-        print(f"[teleop] {status} | {self.state.describe()}", flush=True)
+        print(f"{status} | {self.state.describe()}", flush=True)
 
     def take_status(self) -> str | None:
         """Return and clear the status set since the last call."""
@@ -203,7 +153,16 @@ class KeyboardTeleop:
         self.state.step(dt, self.keys.held)
 
 
+def _extract_jpeg(value: pa.Array) -> bytes:
+    """Return the raw JPEG payload of an image input (a uint8 Arrow array)."""
+    return value.to_numpy(zero_copy_only=False).astype(np.uint8).tobytes()
+
+
 def _run(args: argparse.Namespace) -> None:
+    asyncio.run(_run_async(args))
+
+
+async def _run_async(args: argparse.Namespace) -> None:
     state = TeleopState(
         home_right=np.array(args.home_right, dtype=np.float64),
         home_left=np.array(args.home_left, dtype=np.float64),
@@ -216,69 +175,65 @@ def _run(args: argparse.Namespace) -> None:
     )
     teleop = KeyboardTeleop(state)
 
-    print(HELP_TEXT, flush=True)
-    print(
-        "[teleop] keys are captured globally — they drive the robot from "
-        "whatever window has focus.",
-        flush=True,
-    )
-
-    trusted = accessibility_state()
-    if trusted is not None:
-        # Only ever context: this reports False on setups whose events arrive
-        # anyway, so the silent-listener check below is the real verdict.
-        print(f"[teleop] macOS accessibility trusted: {trusted}", flush=True)
-
-    listener = keyboard.Listener(on_press=teleop.on_press, on_release=teleop.on_release)
-    try:
-        listener.start()
-        listener.wait()
-    except Exception as error:  # noqa: BLE001 - the node stays useful either way
-        print(f"[teleop] keyboard listener did not start: {error}", flush=True)
-    else:
-        print(f"[teleop] keyboard listener running: {listener.running}", flush=True)
+    server = WebTeleopServer(on_key=teleop.enqueue, host=args.host, port=args.port)
+    await server.start()
 
     node = dora.Node()
     node.send_output("status", pa.array(["ready"]))
 
-    last = time.perf_counter()
-    started = last
-    warned_silent = False
+    integrator = asyncio.create_task(_integrate(node, teleop, state))
     try:
-        for event in node:
-            if event["type"] != "INPUT" or event["id"] != "tick":
+        while True:
+            # Poll instead of blocking on the dora iterator: while no event is
+            # waiting, the sleep hands the loop to the other tasks (WebRTC and
+            # the integrator), which would all stall behind a blocking next().
+            if node.is_empty():
+                await asyncio.sleep(0.001)
                 continue
-
-            now = time.perf_counter()
-            dt = min(now - last, _MAX_DT)
-            last = now
-
-            if (
-                not warned_silent
-                and teleop.events_seen == 0
-                and now - started > _SILENT_LISTENER_SECONDS
-            ):
-                warned_silent = True
-                print(
-                    f"[teleop] WARNING: no key event in "
-                    f"{_SILENT_LISTENER_SECONDS:.0f}s. "
-                    f"{_SILENT_LISTENER_PREFIX} {_ACCESSIBILITY_HINT}",
-                    flush=True,
-                )
-
-            teleop.step(dt)
-
-            metadata = {"timestamp": time.time_ns()}
-            node.send_output(
-                "pose_right", build_pose_output(state.pose(RIGHT)), metadata
-            )
-            node.send_output("pose_left", build_pose_output(state.pose(LEFT)), metadata)
-
-            status = teleop.take_status()
-            if status is not None:
-                node.send_output("status", pa.array([status]), metadata)
+            event = node.next()
+            if event is None or event["type"] == "STOP":
+                break
+            if event["type"] != "INPUT":
+                continue
+            if event["id"] == "image":
+                server.push_jpeg(_extract_jpeg(event["value"]))
     finally:
-        listener.stop()
+        teleop.running = False
+        await integrator
+        await server.stop()
+
+
+async def _integrate(
+    node: dora.Node,
+    teleop: KeyboardTeleop,
+    state: TeleopState,
+) -> None:
+    """Advance the target pose and publish it at the node's own pace."""
+    last = time.perf_counter()
+    while teleop.running:
+        await asyncio.sleep(_STEP_SECONDS)
+        now = time.perf_counter()
+        dt = min(now - last, _MAX_DT)
+        last = now
+
+        teleop.step(dt)
+
+        metadata = {"timestamp": time.time_ns()}
+        node.send_output("pose_right", build_pose_output(state.pose(RIGHT)), metadata)
+        node.send_output("pose_left", build_pose_output(state.pose(LEFT)), metadata)
+
+        status = teleop.take_status()
+        if status is not None:
+            node.send_output("status", pa.array([status]), metadata)
+
+
+def _default_port() -> int:
+    """Return the default web server port, PORT if set."""
+    raw = os.environ.get("PORT", "8080")
+    try:
+        return int(raw)
+    except ValueError:
+        raise SystemExit(f"PORT must be an integer, got {raw!r}") from None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -343,6 +298,20 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("X", "Y", "Z"),
         default=DEFAULT_POS_MAX.tolist(),
         help="upper workspace bound",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("HOST", "127.0.0.1"),
+        help="address the web server listens on; use 0.0.0.0 to allow "
+        "browsers on other machines; the default can also be set via the "
+        "HOST environment variable (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=_default_port(),
+        help="port the web server listens on; the default can also be set "
+        "via the PORT environment variable (default: %(default)s)",
     )
     return parser
 

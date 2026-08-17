@@ -14,9 +14,10 @@
 
 """Pose integration for keyboard teleoperation.
 
-This module holds the whole teleoperation state machine and deliberately imports
-neither ``dora`` nor ``pynput``, so it can be exercised without a dataflow or a
-keyboard.  ``main`` supplies the events and publishes the results.
+This module holds the whole teleoperation state machine and deliberately
+imports neither ``dora`` nor the WebRTC stack, so it can be exercised without
+a dataflow or a browser.  ``main`` supplies the events and publishes the
+results.
 
 Held keys are read as velocities: each ``step`` advances the target pose by
 ``speed * scale * dt`` along every axis whose key is down.  Orientation is

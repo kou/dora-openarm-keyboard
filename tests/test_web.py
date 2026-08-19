@@ -22,6 +22,7 @@ import time
 import aiohttp
 import av
 import numpy as np
+import pytest
 from aiortc import (
     RTCConfiguration,
     RTCPeerConnection,
@@ -123,14 +124,17 @@ async def _run_client(server, events, port):
         script = await response.text()
         assert "keydown" in script
 
-        response = await session.get(f"http://127.0.0.1:{port}/help.txt")
-        assert response.content_type == "text/plain"
-        help_text = await response.text()
-        assert "LEFT ARM (left hand)" in help_text
-
         pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
         try:
             channel = pc.createDataChannel("keys")
+
+            @pc.on("datachannel")
+            def on_datachannel(dc):
+                if dc.label == "help":
+
+                    @dc.on("message")
+                    def on_message(message):
+                        received["help"] = message
 
             @pc.on("track")
             def on_track(track):
@@ -166,5 +170,87 @@ async def _run_client(server, events, port):
                 await asyncio.sleep(0.05)
             assert received["frame"].width == 64
             assert received["frame"].height == 48
+
+            await _wait_for(lambda: "help" in received)
+            assert "LEFT ARM (left hand)" in received["help"]
         finally:
             await pc.close()
+
+
+def test_oneshot_signaling():
+    # WebRTC-only mode: no HTTP server. An offer is handed to negotiate_oneshot,
+    # the answer comes back over a TCP socket the caller listens on, and once
+    # the browser applies it the data channel carries keys to on_key as usual.
+    events: queue.SimpleQueue = queue.SimpleQueue()
+    server = WebTeleopServer(
+        on_key=lambda action, name: events.put((action, name)),
+        host="127.0.0.1",
+        port=0,
+    )
+    asyncio.run(_run_oneshot(server, events))
+    assert events.get_nowait() == ("press", "w")
+
+
+async def _run_oneshot(server, events):
+    answer: dict = {}
+
+    async def handle_answer(reader, writer):
+        answer["sdp"] = (await reader.read()).decode("utf-8")
+        writer.close()
+
+    tcp = await asyncio.start_server(handle_answer, "127.0.0.1", 0)
+    host, port = tcp.sockets[0].getsockname()[:2]
+
+    pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+    try:
+        async with tcp:
+            channel = pc.createDataChannel("keys")
+            pc.addTransceiver("video", direction="recvonly")
+            await pc.setLocalDescription(await pc.createOffer())
+
+            # negotiate_oneshot blocks until the peer connects, so relaying the
+            # answer to the browser has to happen concurrently, the way a real
+            # signaling broker would.
+            negotiate = asyncio.ensure_future(
+                server.negotiate_oneshot(pc.localDescription.sdp, host, port, 10.0)
+            )
+            await _wait_for(lambda: "sdp" in answer)
+            await pc.setRemoteDescription(
+                RTCSessionDescription(sdp=answer["sdp"], type="answer")
+            )
+            await negotiate
+
+            await _wait_for(lambda: channel.readyState == "open")
+            channel.send(json.dumps({"type": "keydown", "key": "W"}))
+            await _wait_for(lambda: events.qsize() >= 1)
+    finally:
+        await pc.close()
+        await server.stop()
+
+
+def test_oneshot_connect_timeout():
+    # The answer is sent but the browser never applies it, so the peer never
+    # connects: negotiate_oneshot gives up after the timeout and raises.
+    server = WebTeleopServer(on_key=lambda action, name: None, host="127.0.0.1", port=0)
+    asyncio.run(_run_oneshot_timeout(server))
+
+
+async def _run_oneshot_timeout(server):
+    async def handle_answer(reader, writer):
+        await reader.read()
+        writer.close()
+
+    tcp = await asyncio.start_server(handle_answer, "127.0.0.1", 0)
+    host, port = tcp.sockets[0].getsockname()[:2]
+
+    pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+    try:
+        async with tcp:
+            pc.createDataChannel("keys")
+            pc.addTransceiver("video", direction="recvonly")
+            await pc.setLocalDescription(await pc.createOffer())
+            with pytest.raises(RuntimeError):
+                await server.negotiate_oneshot(pc.localDescription.sdp, host, port, 0.5)
+    finally:
+        await pc.close()
+        await server.stop()

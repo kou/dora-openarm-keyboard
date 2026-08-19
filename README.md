@@ -83,6 +83,10 @@ actually have focus (click the page once)?
 --pos-max        upper workspace bound X Y Z   (default: 0.8 0.8 0.8)
 --host           web server bind address       (default: 127.0.0.1)
 --port           web server port               (default: 8080)
+--offer          SDP offer (WebRTC-only mode; see below)
+--answer-host    host to write the SDP answer to (WebRTC-only mode)
+--answer-port    port to write the SDP answer to (WebRTC-only mode)
+--connect-timeout  seconds to wait for the browser to connect (default: 60)
 ```
 
 The `--host` and `--port` defaults can also be overridden with the `HOST`
@@ -93,6 +97,30 @@ keyframe, expressed in its `arm_origin` frame. The IK and MuJoCo nodes start
 from that same keyframe, so publishing anything else would make IK drag both
 arms across the workspace on the first tick. After changing scene or keyframe,
 we need to follow the changes.
+
+## WebRTC-only mode
+
+By default the node hosts the page itself. Pass `--offer` (or set `OFFER`) to
+run it as a pure WebRTC peer instead, with **no HTTP server**: another service
+hosts `index.html`/`teleop.js` and brokers signaling, and this node only runs
+the robot side of the connection.
+
+- `--offer` / `OFFER` — the browser's SDP offer, handed in at startup. Just the
+  bare SDP; the type is always `offer`.
+- `--answer-host` / `ANSWER_HOST` (default `127.0.0.1`) and `--answer-port` /
+  `ANSWER_PORT` — the TCP host and port this node connects to and writes the
+  answer SDP to (then closes). The service listening there wraps it back into
+  an `answer` and relays it to the browser.
+
+This is a **one-shot** connection: the offer is fixed at startup, so the node
+runs that single peer for its whole life; reconnecting means restarting the
+node. `--host`/`--port` are ignored in this mode.
+
+After the answer is sent, the node waits up to `--connect-timeout` /
+`CONNECT_TIMEOUT` seconds (default 60) for the browser to connect. If the
+connection never comes up — nobody applied the answer, or the media path
+failed — the node exits instead of holding a dead peer, so a supervisor can
+restart it for a fresh offer.
 
 ## Quick start
 

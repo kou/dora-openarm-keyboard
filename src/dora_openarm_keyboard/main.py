@@ -176,7 +176,26 @@ async def _run_async(args: argparse.Namespace) -> None:
     teleop = KeyboardTeleop(state)
 
     server = WebTeleopServer(on_key=teleop.enqueue, host=args.host, port=args.port)
-    await server.start()
+    if args.offer is not None:
+        # WebRTC-only mode: no HTTP server. The offer was handed in at startup
+        # and the answer goes back over a TCP socket the caller is listening on;
+        # this node then runs that single peer for its whole life. If nobody is
+        # listening for the answer, or the browser never connects, exit cleanly
+        # instead of dumping a traceback or holding a dead connection.
+        if args.answer_port is None:
+            raise SystemExit("--answer-port is required when --offer is given")
+        try:
+            await server.negotiate_oneshot(
+                args.offer,
+                args.answer_host,
+                args.answer_port,
+                args.connect_timeout,
+            )
+        except (OSError, RuntimeError) as error:
+            await server.stop()
+            raise SystemExit(f"WebRTC-only mode failed: {error}") from None
+    else:
+        await server.start()
 
     node = dora.Node()
     node.send_output("status", pa.array(["ready"]))
@@ -225,6 +244,26 @@ async def _integrate(
         status = teleop.take_status()
         if status is not None:
             node.send_output("status", pa.array([status]), metadata)
+
+
+def _default_answer_port() -> int | None:
+    """Return the default answer port, ANSWER_PORT if set, else None."""
+    raw = os.environ.get("ANSWER_PORT")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        raise SystemExit(f"ANSWER_PORT must be an integer, got {raw!r}") from None
+
+
+def _default_connect_timeout() -> float:
+    """Return the WebRTC-only connect timeout, CONNECT_TIMEOUT if set."""
+    raw = os.environ.get("CONNECT_TIMEOUT", "60")
+    try:
+        return float(raw)
+    except ValueError:
+        raise SystemExit(f"CONNECT_TIMEOUT must be a number, got {raw!r}") from None
 
 
 def _default_port() -> int:
@@ -312,6 +351,40 @@ def build_parser() -> argparse.ArgumentParser:
         default=_default_port(),
         help="port the web server listens on; the default can also be set "
         "via the PORT environment variable (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--offer",
+        default=os.environ.get("OFFER"),
+        help="run in WebRTC-only mode (no HTTP server): the browser's SDP "
+        "offer (the bare SDP; its type is always offer), handed in at startup. "
+        "The answer SDP is written to --answer-host/--answer-port and this node "
+        "then runs that single peer for its whole life; --host/--port are "
+        "ignored. Another service hosts the page and brokers signaling. Can "
+        "also be set via the OFFER environment variable.",
+    )
+    parser.add_argument(
+        "--answer-host",
+        default=os.environ.get("ANSWER_HOST", "127.0.0.1"),
+        help="in WebRTC-only mode, the host to connect to and write the answer "
+        "SDP to; the default can also be set via the ANSWER_HOST environment "
+        "variable (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--answer-port",
+        type=int,
+        default=_default_answer_port(),
+        help="in WebRTC-only mode, the port to connect to and write the answer "
+        "SDP to; required when --offer is given, and can also be set via the "
+        "ANSWER_PORT environment variable",
+    )
+    parser.add_argument(
+        "--connect-timeout",
+        type=float,
+        default=_default_connect_timeout(),
+        help="in WebRTC-only mode, seconds to wait for the browser to connect "
+        "after the answer is sent before giving up and exiting; the default can "
+        "also be set via the CONNECT_TIMEOUT environment variable "
+        "(default: %(default)s)",
     )
     return parser
 

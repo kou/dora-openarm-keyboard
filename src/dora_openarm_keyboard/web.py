@@ -22,9 +22,18 @@ signaling endpoint, then talks WebRTC with the browser:
   ``{"type": "keydown" | "keyup", "key": <KeyboardEvent.key>}`` and are handed
   to ``main`` through the ``on_key`` callback as
   ``("press" | "release", name)``, the shape the teleoperation core consumes;
-* MuJoCo camera frames flow the other way: ``main`` pushes the JPEG payload of
-  every ``image`` input via :meth:`WebTeleopServer.push_jpeg` and each connected
-  browser receives them as a live video track.
+* the key bindings go the other way on a data channel labelled ``help``: the
+  node opens it and sends :data:`~.keymap.HELP_TEXT` once, so the page shows the
+  current bindings even when a different host served it;
+* MuJoCo camera frames flow the other way too: ``main`` pushes the JPEG payload
+  of every ``image`` input via :meth:`WebTeleopServer.push_jpeg` and each
+  connected browser receives them as a live video track.
+
+For deployments where another service hosts the page and brokers signaling,
+:meth:`WebTeleopServer.negotiate_oneshot` answers a single offer handed in at
+startup and writes the answer to a TCP socket, with no HTTP server at all; if
+the browser does not connect within a timeout it raises, so the node exits
+rather than stranding.
 
 Everything — the HTTP server, WebRTC, and the dora polling loop in ``main`` —
 runs on one asyncio loop, so ``push_jpeg`` and the ``on_key`` callback are
@@ -165,7 +174,6 @@ class WebTeleopServer:
         app = aioweb.Application()
         app.router.add_get("/", self._handle_index)
         app.router.add_get("/teleop.js", self._handle_script)
-        app.router.add_get("/help.txt", self._handle_help)
         app.router.add_post("/offer", self._handle_offer)
         runner = aioweb.AppRunner(app, access_log=None)
         await runner.setup()
@@ -207,24 +215,30 @@ class WebTeleopServer:
             text=self._static_text("teleop.js"), content_type="text/javascript"
         )
 
-    async def _handle_help(self, request: aioweb.Request) -> aioweb.Response:
-        return aioweb.Response(text=HELP_TEXT, content_type="text/plain")
+    def _create_peer(self) -> RTCPeerConnection:
+        """Build a peer connection wired to the teleoperation core.
 
-    async def _handle_offer(self, request: aioweb.Request) -> aioweb.Response:
-        params = await request.json()
-        offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
-
+        The browser opens the ``keys`` channel to send key events; we open a
+        ``help`` channel the other way and push :data:`HELP_TEXT` down it once
+        it is open, so the page shows the current bindings without any HTTP
+        fetch — the only source of the help text is this node's keymap.
+        """
         iceServers = [RTCIceServer(urls=["stun:stun.cloudflare.com:3478"])]
         pc = RTCPeerConnection(RTCConfiguration(iceServers=iceServers))
         self._pcs.add(pc)
         held: set[str] = set()
-        peer = request.remote
 
         @pc.on("datachannel")
         def on_datachannel(channel) -> None:
             @channel.on("message")
             def on_message(message) -> None:
                 self._handle_key_message(message, held)
+
+        help_channel = pc.createDataChannel("help")
+
+        @help_channel.on("open")
+        def on_help_open() -> None:
+            help_channel.send(HELP_TEXT)
 
         @pc.on("connectionstatechange")
         async def on_connectionstatechange() -> None:
@@ -234,22 +248,90 @@ class WebTeleopServer:
                     self._on_key("release", name)
                 if held:
                     print(
-                        f"browser {peer} left with keys held; released {sorted(held)}",
+                        f"browser left with keys held; released {sorted(held)}",
                         flush=True,
                     )
                 else:
-                    print(f"browser disconnected: {peer}", flush=True)
+                    print("browser disconnected", flush=True)
                 held.clear()
                 self._pcs.discard(pc)
                 await pc.close()
 
         pc.addTrack(JPEGVideoTrack(self._source))
+        return pc
+
+    @staticmethod
+    async def _answer(pc: RTCPeerConnection, offer: RTCSessionDescription) -> dict:
+        """Consume an offer and return the SDP answer as a ``{sdp, type}`` dict.
+
+        aiortc's ``setLocalDescription`` waits for ICE gathering to finish, so
+        the returned SDP already carries every candidate: signaling is a single
+        offer/answer round with no trickle.
+        """
         await pc.setRemoteDescription(offer)
         await pc.setLocalDescription(await pc.createAnswer())
+        return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
 
-        return aioweb.json_response(
-            {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
-        )
+    async def _handle_offer(self, request: aioweb.Request) -> aioweb.Response:
+        params = await request.json()
+        offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+        pc = self._create_peer()
+        return aioweb.json_response(await self._answer(pc, offer))
+
+    async def negotiate_oneshot(
+        self,
+        offer_sdp: str,
+        answer_host: str,
+        answer_port: int,
+        connect_timeout: float = 60.0,
+    ) -> None:
+        """Answer a single offer handed in at startup, with no HTTP server.
+
+        The offer arrives out of band (a command-line argument or environment
+        variable) as the bare SDP -- its type is always ``offer`` -- and the
+        answer goes back the same way, the bare answer SDP written to the TCP
+        socket the caller is listening on at ``answer_host``/``answer_port``.
+        This is the WebRTC-only mode: another service hosts the page and brokers
+        signaling, and this node just runs the peer for its lifetime.
+
+        After sending the answer, waits up to ``connect_timeout`` seconds for the
+        peer to connect. If it never does -- the browser never applied the
+        answer, or the media path never came up -- the peer is closed and this
+        raises :class:`RuntimeError`, so a stranded one-shot node exits instead
+        of holding a dead connection forever.
+        """
+        offer = RTCSessionDescription(sdp=offer_sdp, type="offer")
+        pc = self._create_peer()
+
+        established: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+
+        @pc.on("connectionstatechange")
+        def on_established() -> None:
+            if established.done():
+                return
+            if pc.connectionState == "connected":
+                established.set_result(True)
+            elif pc.connectionState in ("failed", "closed"):
+                established.set_result(False)
+
+        answer = await self._answer(pc, offer)
+
+        _reader, writer = await asyncio.open_connection(answer_host, answer_port)
+        writer.write(answer["sdp"].encode("utf-8"))
+        await writer.drain()
+        writer.write_eof()
+        writer.close()
+        await writer.wait_closed()
+
+        try:
+            connected = await asyncio.wait_for(established, connect_timeout)
+        except TimeoutError:
+            connected = False
+        if not connected:
+            await pc.close()
+            raise RuntimeError(
+                f"no WebRTC connection within {connect_timeout:g}s of the answer"
+            )
 
     def _handle_key_message(self, message: object, held: set[str]) -> None:
         if not isinstance(message, str):

@@ -17,11 +17,9 @@ const heldElement = document.getElementById("held");
 const helpElement = document.getElementById("help");
 const video = document.getElementById("video");
 
-fetch("help.txt")
-  .then((response) => response.text())
-  .then((text) => {
-    helpElement.textContent = text;
-  });
+// The key bindings arrive over a WebRTC "help" data channel the node opens,
+// not over HTTP: the help text lives in the node's keymap, and this page may
+// be served by a different host that has no copy of it.
 
 let channel = null;
 const held = new Set();
@@ -97,9 +95,18 @@ async function connect() {
     setStatus("connected — click the page, then hold keys to move");
   channel.onclose = () => setStatus("disconnected — reload to reconnect");
 
-  pc.addTransceiver("video", { direction: "recvonly" });
   pc.ontrack = (event) => {
     video.srcObject = event.streams[0];
+  };
+  pc.addTransceiver("video", { direction: "recvonly" });
+
+  // The node opens a "help" channel and sends the key bindings once.
+  pc.ondatachannel = (event) => {
+    if (event.channel.label === "help") {
+      event.channel.onmessage = (message) => {
+        helpElement.textContent = message.data;
+      };
+    }
   };
 
   await pc.setLocalDescription(await pc.createOffer());
